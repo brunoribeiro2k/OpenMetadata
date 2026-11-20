@@ -280,6 +280,9 @@ class LookerSource(DashboardServiceSource):
         self._pending_standalone_lineage: list[tuple[LookMlView, str, str, str]] = []
 
         self._added_lineage: dict = {}
+        # Native derived tables, linked to their Explore once every Explore is processed:
+        # data model name -> (view, model name)
+        self._native_derived_tables: dict[str, tuple[LookMlView, str]] = {}
 
     @classmethod
     def create(
@@ -804,6 +807,8 @@ class LookerSource(DashboardServiceSource):
             yield from self._add_standalone_view_lineage(view, project_name, model_name)
         self._pending_standalone_lineage = []
 
+        yield from self.yield_native_derived_table_lineage()
+
     def _resolve_pending_datamodels(self) -> dict[str, DashboardDataModel | None]:
         """Fetch the data models written by this stage, keyed by their data model name.
 
@@ -959,6 +964,95 @@ class LookerSource(DashboardServiceSource):
                     stackTrace=traceback.format_exc(),
                 )
             )
+
+    def _find_explore_model(self, model_name: str, explore_name: str) -> DashboardDataModel | None:
+        """
+        Find an Explore's data model in the model given, processed or in OpenMetadata.
+        Else, an Explore of that name in another processed model, when only one has it.
+        """
+        datamodel_name = build_datamodel_name(model_name, explore_name)
+        explore_model = self._explores_cache.get(datamodel_name) or self._build_data_model(datamodel_name)
+        if explore_model:
+            return explore_model
+        candidates = {
+            cached_model.id.root: cached_model
+            for cached_model in self._explores_cache.values()
+            if cached_model and cached_model.displayName == explore_name
+        }
+        if len(candidates) == 1:
+            return next(iter(candidates.values()))
+        if candidates:
+            logger.debug(f"Explore [{explore_name}] is in several models and none is [{model_name}]")
+        return None
+
+    def _get_native_derived_table_column_lineage(
+        self,
+        view: LookMlView,
+        explore_model: DashboardDataModel,
+        view_model: DashboardDataModel,
+    ) -> list[ColumnLineage]:
+        """
+        Column lineage Explore field -> view field: each column of the explore_source reads
+        an Explore field, and each view field reads columns through ${TABLE}.column.
+        """
+        explore_source = view.derived_table.explore_source
+        explore_fields = {
+            column.name: column.field or f"{explore_source.name}.{column.name}" for column in explore_source.columns
+        }
+        # A dimension with no `sql` reads the column of its own name
+        dimensions = [
+            dimension if dimension.sql else dimension.model_copy(update={"sql": f"${{TABLE}}.{dimension.name}"})
+            for dimension in view.dimensions
+        ]
+        column_lineage = []
+        for table_column, view_field in self._extract_column_lineage(
+            view.model_copy(update={"dimensions": dimensions})
+        ):
+            explore_field = explore_fields.get(table_column)
+            if not explore_field:
+                continue
+            from_column = self._get_data_model_column_fqn(data_model_entity=explore_model, column=explore_field)
+            to_column = self._get_data_model_column_fqn(data_model_entity=view_model, column=view_field)
+            if from_column and to_column:
+                lineage = ColumnLineage(fromColumns=[from_column], toColumn=to_column)
+                if lineage not in column_lineage:
+                    column_lineage.append(lineage)
+        return column_lineage
+
+    def yield_native_derived_table_lineage(self) -> Iterable[Either[AddLineageRequest]]:
+        """
+        Add the lineage Explore -> view for native derived tables, built from an Explore
+        with `explore_source` instead of SQL. Run once every Explore is processed, so the
+        source Explore's data model exists whatever the order.
+        https://cloud.google.com/looker/docs/creating-ndts
+        """
+        for datamodel_name, (view, model_name) in self._native_derived_tables.items():
+            explore_name = view.derived_table.explore_source.name
+            try:
+                view_model = self._build_data_model(datamodel_name)
+                explore_model = self._find_explore_model(model_name, explore_name)
+                if not (view_model and explore_model):
+                    logger.warning(
+                        f"No lineage for native derived table [{view.name}]: data model of the view or of"
+                        f" its Explore [{explore_name}] not found"
+                    )
+                    continue
+                lineage_request = self._get_add_lineage_request(
+                    from_entity=explore_model,
+                    to_entity=view_model,
+                    column_lineage=self._get_native_derived_table_column_lineage(view, explore_model, view_model),
+                )
+                if lineage_request:
+                    yield lineage_request
+            except Exception as err:
+                yield Either(
+                    left=StackTraceError(
+                        name=view.name,
+                        error=f"Error yielding lineage for native derived table [{view.name}]: {err}",
+                        stackTrace=traceback.format_exc(),
+                    )
+                )
+        self._native_derived_tables = {}
 
     def _add_dependency_edge(self, view_name: str, view_references: List[str]):  # noqa: UP006
         """
@@ -1147,6 +1241,9 @@ class LookerSource(DashboardServiceSource):
                         column_lineage=column_lineage,
                     )
 
+            elif view.derived_table and view.derived_table.explore_source:
+                self._native_derived_tables[f"{model_name}_{view.name}_view"] = (view, model_name)
+
             elif view.derived_table:
                 sql_query = view.derived_table.sql
                 if not sql_query:
@@ -1275,6 +1372,12 @@ class LookerSource(DashboardServiceSource):
                         to_entity=self._view_data_model,
                         column_lineage=column_lineage,
                     )
+
+            elif view.derived_table and view.derived_table.explore_source:
+                self._native_derived_tables[build_datamodel_name(explore.model_name, view.name) + "_view"] = (
+                    view,
+                    explore.model_name,
+                )
 
             elif view.derived_table:
                 sql_query = view.derived_table.sql

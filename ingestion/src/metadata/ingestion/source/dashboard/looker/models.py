@@ -28,11 +28,28 @@ class LookMlField(BaseModel):
     sql: Optional[str] = Field(None, description="Field SQL")  # noqa: UP045
 
 
+class LookMlExploreSourceColumn(BaseModel):
+    name: str = Field(..., description="Column name in the native derived table")
+    field: Optional[str] = Field(  # noqa: UP045
+        None,
+        description="Explore field the column reads, as view.field. Defaults to the column name in the Explore.",
+    )
+
+
+class LookMlExploreSource(BaseModel):
+    name: str = Field(..., description="Explore the native derived table is built from")
+    columns: List[LookMlExploreSourceColumn] = Field([], description="Columns picked from the Explore")  # noqa: UP006
+
+
 class LookMlDerivedTableField(BaseModel):
     sql: Optional[str] = Field(None, description="Declares the SQL query for a derived table.")  # noqa: UP045
     sql_create: Optional[str] = Field(  # noqa: UP045
         None,
         description="Defines a SQL CREATE statement",
+    )
+    explore_source: Optional[LookMlExploreSource] = Field(  # noqa: UP045
+        None,
+        description="Explore a native derived table is built from",
     )
 
 
