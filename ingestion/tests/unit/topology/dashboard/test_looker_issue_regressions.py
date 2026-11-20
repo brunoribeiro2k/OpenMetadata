@@ -60,6 +60,7 @@ def _view_lineage_source() -> LookerSource:
     source._views_cache = {}
     source._parsed_views = {}
     source._unparsed_views = {}
+    source._table_views = set()
     source._lookml_constants_map = {}
     source._view_data_model = _view_data_model(LookMlView(name="table_details"))
     source._added_lineage = {}

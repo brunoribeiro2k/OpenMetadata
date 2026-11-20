@@ -272,6 +272,8 @@ class LookerSource(DashboardServiceSource):
         # A view waiting on references, with the data models it waits for:
         # one per explore that uses it.
         self._unparsed_lookml_views: dict[str, LookMlView] = {}
+        # The parsed views that read a table, whose `_parsed_views` entry is that table
+        self._table_views: set[str] = set()
         self._unparsed_view_datamodels: dict[str, list[tuple[str, str | None, str | None]]] = {}
         self._retrying_unparsed_views = False
         self._derived_dependencies = nx.DiGraph()
@@ -1047,14 +1049,34 @@ class LookerSource(DashboardServiceSource):
                 view_name=view.name,
             )
 
+            if find_derived_references(sql_table_name):
+                # `sql_table_name: ${other_view.SQL_TABLE_NAME}` reads the other view's source
+                resolved_table_name = self.replace_derived_references(sql_table_name)
+                if view_references := find_derived_references(resolved_table_name):
+                    self._defer_view(view, sql_table_name, view_references, datamodel_name, model_name, explore_name)
+                    logger.debug(
+                        f"Not all references are replaced for view [{view.name}]. Parsing it once"
+                        f" {view_references} are parsed."
+                    )
+                    return
+                referenced_view = re.fullmatch(DERIVED_REFERENCES, sql_table_name.strip())
+                if referenced_view and referenced_view.group(1) in self._table_views:
+                    # The other view names a table: keep this view's column lineage to it
+                    sql_table_name = self._parsed_views[referenced_view.group(1)]
+                else:
+                    # The other view is a derived table: this view reads its query
+                    yield from self._build_lineage_for_view(view.name, f"SELECT * FROM {resolved_table_name}")
+                    sql_table_name = None
+
             # Column lineage only depends on the view definition, so resolve it once
             column_lineage = self._extract_column_lineage(view)
 
-            for db_service_prefix in self.get_db_service_prefixes() or []:
+            for db_service_prefix in (self.get_db_service_prefixes() or []) if sql_table_name else []:
                 db_service_name, *_ = self.parse_db_service_prefix(db_service_prefix)
                 dialect = self._get_db_dialect(db_service_name)
                 source_table_name = self._clean_table_name(sql_table_name, dialect)
                 self._parsed_views[view.name] = source_table_name
+                self._table_views.add(view.name)
 
                 # View to the source is only there if we are informing the dbServiceNames
                 yield from self.build_lineage_requests(

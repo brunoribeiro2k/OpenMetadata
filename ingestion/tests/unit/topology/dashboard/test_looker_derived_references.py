@@ -129,3 +129,29 @@ class TestDerivedReferences:
 
         assert list(looker.build_lineage_for_unparsed_views()) == []
         assert "daily" in looker._unparsed_views
+
+    def test_sql_table_name_on_a_table_view(self, looker):
+        process(looker, table_view("fact_usage", "db.schema.fact_usage"))
+        lineage = process(looker, table_view("usage", "${fact_usage.SQL_TABLE_NAME}"))
+        assert lineage == [("db.schema.fact_usage", "model_usage_view")]
+        assert looker._parsed_views["usage"] == "db.schema.fact_usage"
+
+    def test_sql_table_name_on_a_quoted_table(self, looker):
+        base_lineage = process(looker, table_view("base", 'db.schema."order items"'))
+        lineage = process(looker, table_view("usage", "${base.SQL_TABLE_NAME}"))
+        assert lineage == [(base_lineage[0][0], "model_usage_view")]
+        assert looker._parsed_views["usage"] == looker._parsed_views["base"]
+
+    def test_sql_table_name_on_a_derived_view(self, looker):
+        process(looker, derived_view("daily", "SELECT a, b FROM db.schema.events"))
+        lineage = process(looker, table_view("usage", "${daily.SQL_TABLE_NAME}"))
+        assert lineage == [("db.schema.events", "model_usage_view")]
+
+    def test_sql_table_name_waits_for_its_reference(self, looker):
+        assert process(looker, table_view("usage", "${fact_usage.SQL_TABLE_NAME}")) == []
+        assert "usage" in looker._unparsed_views
+
+        lineage = process(looker, table_view("fact_usage", "db.schema.fact_usage"))
+
+        assert ("db.schema.fact_usage", "model_usage_view") in lineage
+        assert looker._unparsed_views == {}
