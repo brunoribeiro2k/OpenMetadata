@@ -44,7 +44,7 @@ from typing import (  # noqa: UP035
 import giturlparse
 import lkml
 import networkx as nx
-from liquid import Template
+from liquid import Environment, Template, Undefined
 from looker_sdk.sdk.api40.methods import Looker40SDK
 from looker_sdk.sdk.api40.models import Dashboard as LookerDashboard
 from looker_sdk.sdk.api40.models import (
@@ -233,6 +233,102 @@ def find_derived_references(sql_query: str) -> List[str]:  # noqa: UP006
         return []
     matches = re.findall(DERIVED_REFERENCES, sql_query)
     return matches  # noqa: RET504
+
+
+# Looker-only Liquid tags, which python-liquid doesn't know. Each one is filled with a
+# neutral value that keeps the SQL valid without changing the tables it reads.
+# https://cloud.google.com/looker/docs/templated-filters
+LOOKER_FILTER_TAGS = re.compile(
+    r"\{%-?\s*(condition|incrementcondition)\b.*?%\}(.*?)\{%-?\s*end\1\s*-?%\}",
+    re.DOTALL | re.IGNORECASE,
+)
+LIQUID_RAW_BLOCKS = re.compile(r"(\{%-?\s*raw\s*-?%\}.*?\{%-?\s*endraw\s*-?%\})", re.DOTALL | re.IGNORECASE)
+LOOKER_DATE_TAGS = re.compile(r"\{%-?\s*(date_start|date_end)\b.*?-?%\}", re.IGNORECASE)
+LOOKER_PARAMETER_TAGS = re.compile(r"\{%-?\s*parameter\b.*?-?%\}", re.IGNORECASE)
+NEUTRAL_FILTER = "1=1"
+NEUTRAL_DATE = "TIMESTAMP '2000-01-01 00:00:00'"
+NEUTRAL_PARAMETER = "1"
+
+
+class _NullUndefined(Undefined):
+    """
+    An undefined value, such as `{{ _user_attributes['country'] }}`, renders as NULL:
+    valid wherever a value goes, quoted or not. It stays falsy in `{% if %}`.
+    """
+
+    def __str__(self) -> str:
+        return "NULL"
+
+
+class _DerivedSqlEnvironment(Environment):
+    """Looker's Liquid takes parentheses and `not` in conditions, as in
+    `{% if a and (b or c) %}`, which standard Liquid rejects."""
+
+    logical_parentheses = True
+    logical_not_operator = True
+
+
+_DERIVED_SQL_ENVIRONMENT = _DerivedSqlEnvironment(undefined=_NullUndefined)
+
+
+def liquid_context(
+    model_name: str | None = None,
+    explore_name: str | None = None,
+    view_name: str | None = None,
+) -> dict[str, object]:
+    """
+    The values Liquid sees during ingestion: `openmetadata` is true, and Looker's
+    `_model._name`, `_explore._name` and `_view._name` are the names being ingested.
+    """
+    context: dict[str, object] = {"openmetadata": True}
+    for scope, name in (("_model", model_name), ("_explore", explore_name), ("_view", view_name)):
+        if name:
+            context[scope] = {"_name": name}
+    return context
+
+
+def _neutral_filter(match: re.Match) -> str:
+    """A filter always holds, and keeps its field expression, which can read a column or a table."""
+    expression = match.group(2).strip()
+    return f"(({expression}) IS NULL OR {NEUTRAL_FILTER})" if expression else NEUTRAL_FILTER
+
+
+def _fill_looker_tags(sql_query: str) -> str:
+    """Looker's own tags are filled outside `{% raw %}` blocks only, whose text stays as written."""
+    parts = LIQUID_RAW_BLOCKS.split(sql_query)
+    for index in range(0, len(parts), 2):
+        filled = LOOKER_FILTER_TAGS.sub(_neutral_filter, parts[index])
+        filled = LOOKER_DATE_TAGS.sub(NEUTRAL_DATE, filled)
+        parts[index] = LOOKER_PARAMETER_TAGS.sub(NEUTRAL_PARAMETER, filled)
+    return "".join(parts)
+
+
+def render_derived_sql(
+    sql_query: str,
+    model_name: str | None = None,
+    explore_name: str | None = None,
+    view_name: str | None = None,
+) -> str:
+    """
+    Derived table SQL might hold Liquid, filled in by Looker with the dashboard user's
+    picks when it runs the query, e.g.:
+        WHERE {% condition country %} c.country {% endcondition %}
+          AND d >= {% date_start period %}
+    The SQL parsers reject the tags, so we fill them with neutral values first:
+    a filter as `((<field>) IS NULL OR 1=1)`, a date as a fixed timestamp, a parameter
+    as `1`, an undefined value as NULL. `{% if %}` takes the branch Liquid picks with no
+    user values, and sees the same context as `sql_table_name` (see `liquid_context`).
+    If the template can't be rendered, the SQL is returned as is.
+    """
+    if not sql_query or ("{%" not in sql_query and "{{" not in sql_query):
+        return sql_query
+    try:
+        rendered = _fill_looker_tags(sql_query)
+        context = liquid_context(model_name, explore_name, view_name)
+        return _DERIVED_SQL_ENVIRONMENT.from_string(rendered).render(**context)
+    except Exception as err:
+        logger.debug(f"Could not render the Liquid in a derived table, parsing it as is: {err}")
+        return sql_query
 
 
 class LookerSource(DashboardServiceSource):
@@ -1161,7 +1257,7 @@ class LookerSource(DashboardServiceSource):
                         )
                         return
                 logger.debug(f"Processing standalone view [{view.name}] with SQL: \n[{sql_query}]")
-                yield from self._build_lineage_for_view(view.name, sql_query)
+                yield from self._build_lineage_for_view(view.name, sql_query, model_name)
                 if self._unparsed_views:
                     self.build_lineage_for_unparsed_views()
 
@@ -1289,7 +1385,7 @@ class LookerSource(DashboardServiceSource):
                         logger.warning(f"Not all references are replaced for view [{view.name}]. Parsing it later.")
                         return
                 logger.debug(f"Processing view [{view.name}] with SQL: \n[{sql_query}]")
-                yield from self._build_lineage_for_view(view.name, sql_query)
+                yield from self._build_lineage_for_view(view.name, sql_query, explore.model_name, explore.name)
                 if self._unparsed_views:
                     self.build_lineage_for_unparsed_views()
 
@@ -1302,10 +1398,18 @@ class LookerSource(DashboardServiceSource):
                 )
             )
 
-    def _build_lineage_for_view(self, view_name: str, sql_query: str) -> Iterable[Either[AddLineageRequest]]:
+    def _build_lineage_for_view(
+        self,
+        view_name: str,
+        sql_query: str,
+        model_name: str | None = None,
+        explore_name: str | None = None,
+    ) -> Iterable[Either[AddLineageRequest]]:
         """
         Parse the SQL query and build lineage for the view.
+        The query's Liquid, its own or from a referenced view swapped in, is rendered first.
         """
+        sql_query = render_derived_sql(sql_query, model_name, explore_name, view_name)
         for db_service_prefix in self.get_db_service_prefixes() or []:
             db_service_name, *_ = self.parse_db_service_prefix(db_service_prefix)
             lineage_parser = LineageParser(
@@ -1542,12 +1646,8 @@ class LookerSource(DashboardServiceSource):
         :return: rendered table name
         """
         try:
-            context: dict[str, object] = {"openmetadata": True}
-            for scope, name in (("_model", model_name), ("_explore", explore_name), ("_view", view_name)):
-                if name:
-                    context[scope] = {"_name": name}
             template = Template(table_name)
-            sql_table_name = template.render(context)
+            sql_table_name = template.render(liquid_context(model_name, explore_name, view_name))
         except Exception:
             sql_table_name = table_name
         return sql_table_name
