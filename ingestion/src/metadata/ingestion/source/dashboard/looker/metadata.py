@@ -269,6 +269,11 @@ class LookerSource(DashboardServiceSource):
 
         self._parsed_views: Optional[Dict[str, str]] = {}  # noqa: UP006, UP045
         self._unparsed_views: Optional[Dict[str, str]] = {}  # noqa: UP006, UP045
+        # A view waiting on references, with the data models it waits for:
+        # one per explore that uses it.
+        self._unparsed_lookml_views: dict[str, LookMlView] = {}
+        self._unparsed_view_datamodels: dict[str, list[tuple[str, str | None, str | None]]] = {}
+        self._retrying_unparsed_views = False
         self._derived_dependencies = nx.DiGraph()
 
         # Data models yielded by the bulk stage but not yet written by the sink. They are
@@ -804,6 +809,13 @@ class LookerSource(DashboardServiceSource):
             yield from self._add_standalone_view_lineage(view, project_name, model_name)
         self._pending_standalone_lineage = []
 
+        yield from self.build_lineage_for_unparsed_views()
+        for view_name, sql in self._unparsed_views.items():
+            logger.warning(
+                f"No lineage for view [{view_name}]: it references views that were never parsed"
+                f" {find_derived_references(self.replace_derived_references(sql))}"
+            )
+
     def _resolve_pending_datamodels(self) -> dict[str, DashboardDataModel | None]:
         """Fetch the data models written by this stage, keyed by their data model name.
 
@@ -934,23 +946,30 @@ class LookerSource(DashboardServiceSource):
 
     def build_lineage_for_unparsed_views(self) -> Iterable[Either[AddLineageRequest]]:
         """
-        build lineage by parsing the unparsed views containing derived references
+        Build the lineage of the views that were waiting on derived references, once
+        the views they reference are parsed. A view resolved in one pass can unblock
+        others, so passes repeat until one resolves nothing. Each view's lineage goes
+        to its own data models, not to the view being processed when the retry runs.
         """
+        if self._retrying_unparsed_views:
+            return
+        self._retrying_unparsed_views = True
+        current_view_data_model = self._view_data_model
         try:
-            # Doing a reversed topological sort to process the views in the right order
-            for view_name in reversed(list(nx.topological_sort(self._derived_dependencies))):
-                if view_name in self._parsed_views:
-                    # Skip if already processed
-                    continue
-                sql_query = self.replace_derived_references(self._unparsed_views[view_name])
-                if view_references := find_derived_references(sql_query):
-                    # There are still derived references in the view query
-                    logger.debug(f"Views {view_references} not found for {view_name}. Skipping.")
-                    continue
-                self._parsed_views[view_name] = sql_query
-                del self._unparsed_views[view_name]
-                yield from self._build_lineage_for_view(view_name, sql_query)
-
+            resolved = True
+            while resolved and self._unparsed_views:
+                resolved = False
+                for view_name in list(self._unparsed_views):
+                    sql_query = self.replace_derived_references(self._unparsed_views[view_name])
+                    if find_derived_references(sql_query):
+                        continue
+                    resolved = True
+                    self._parsed_views[view_name] = sql_query
+                    del self._unparsed_views[view_name]
+                    view = self._unparsed_lookml_views.pop(view_name, None)
+                    waiting = self._unparsed_view_datamodels.pop(view_name, []) if view else []
+                    for datamodel_name, model_name, explore_name in waiting:
+                        yield from self._retry_view_lineage(view, datamodel_name, model_name, explore_name)
         except Exception as err:
             yield Either(
                 left=StackTraceError(
@@ -959,6 +978,113 @@ class LookerSource(DashboardServiceSource):
                     stackTrace=traceback.format_exc(),
                 )
             )
+        finally:
+            self._view_data_model = current_view_data_model
+            self._retrying_unparsed_views = False
+
+    def _retry_view_lineage(
+        self,
+        view: LookMlView,
+        datamodel_name: str,
+        model_name: str | None,
+        explore_name: str | None,
+    ) -> Iterable[Either[AddLineageRequest]]:
+        """
+        Build a waiting view's lineage into one of its data models. A failure is reported
+        for that data model alone, so the view's other data models still get theirs.
+        """
+        try:
+            self._view_data_model = self._build_data_model(datamodel_name)
+            if self._view_data_model:
+                logger.debug(f"Parsing view [{view.name}] now that its references are parsed")
+                yield from self._yield_view_source_lineage(view, datamodel_name, model_name, explore_name=explore_name)
+        except Exception as err:
+            yield Either(
+                left=StackTraceError(
+                    name=view.name,
+                    error=f"Error yielding lineage for view [{view.name}] into [{datamodel_name}]: {err}",
+                    stackTrace=traceback.format_exc(),
+                )
+            )
+
+    def _defer_view(
+        self,
+        view: LookMlView,
+        sql: str,
+        view_references: list[str],
+        datamodel_name: str,
+        model_name: str | None,
+        explore_name: str | None,
+    ):
+        """
+        Keep a view whose references aren't parsed yet, to retry once they are.
+        """
+        self._add_dependency_edge(view.name, view_references)
+        self._unparsed_views[view.name] = sql
+        self._unparsed_lookml_views[view.name] = view
+        waiting = self._unparsed_view_datamodels.setdefault(view.name, [])
+        if (datamodel_name, model_name, explore_name) not in waiting:
+            waiting.append((datamodel_name, model_name, explore_name))
+
+    def _yield_view_source_lineage(
+        self,
+        view: LookMlView,
+        datamodel_name: str,
+        model_name: str | None = None,
+        explore_name: str | None = None,
+    ) -> Iterable[Either[AddLineageRequest]]:
+        """
+        Add the lineage source -> view for the view's data model, `self._view_data_model`,
+        named `datamodel_name`. A derived table referencing views not parsed yet is kept
+        and retried once they are.
+        """
+        if view.sql_table_name:
+            sql_table_name = self._resolve_lookml_constants(view.sql_table_name)
+            sql_table_name = self._render_table_name(
+                sql_table_name,
+                model_name,
+                explore_name=explore_name,
+                view_name=view.name,
+            )
+
+            # Column lineage only depends on the view definition, so resolve it once
+            column_lineage = self._extract_column_lineage(view)
+
+            for db_service_prefix in self.get_db_service_prefixes() or []:
+                db_service_name, *_ = self.parse_db_service_prefix(db_service_prefix)
+                dialect = self._get_db_dialect(db_service_name)
+                source_table_name = self._clean_table_name(sql_table_name, dialect)
+                self._parsed_views[view.name] = source_table_name
+
+                # View to the source is only there if we are informing the dbServiceNames
+                yield from self.build_lineage_requests(
+                    source=source_table_name,
+                    db_service_prefix=db_service_prefix,
+                    to_entity=self._view_data_model,
+                    column_lineage=column_lineage,
+                )
+
+        elif view.derived_table:
+            sql_query = view.derived_table.sql
+            if not sql_query:
+                return
+            sql_query = self._resolve_lookml_constants(sql_query, strip_unresolved=False)
+            if find_derived_references(sql_query):
+                resolved_sql_query = self.replace_derived_references(sql_query)
+                # If we still have derived references, we cannot process the view yet
+                if view_references := find_derived_references(resolved_sql_query):
+                    self._defer_view(view, sql_query, view_references, datamodel_name, model_name, explore_name)
+                    logger.debug(
+                        f"Not all references are replaced for view [{view.name}]. Parsing it once"
+                        f" {view_references} are parsed."
+                    )
+                    return
+                sql_query = resolved_sql_query
+            logger.debug(f"Processing view [{view.name}] with SQL: \n[{sql_query}]")
+            yield from self._build_lineage_for_view(view.name, sql_query)
+
+        if self._unparsed_views and view.name in self._parsed_views:
+            yield from self.build_lineage_for_unparsed_views()
 
     def _add_dependency_edge(self, view_name: str, view_references: List[str]):  # noqa: UP006
         """
@@ -1073,7 +1199,7 @@ class LookerSource(DashboardServiceSource):
                 continue
         return processed_column_lineage
 
-    def _add_standalone_view_lineage(  # noqa: C901
+    def _add_standalone_view_lineage(
         self, view: LookMlView, project_name: str, model_name: str
     ) -> Iterable[Either[AddLineageRequest]]:
         """
@@ -1125,45 +1251,7 @@ class LookerSource(DashboardServiceSource):
                                 column_lineage=[],
                             )
 
-            db_service_prefixes = self.get_db_service_prefixes()
-
-            if view.sql_table_name:
-                sql_table_name = self._resolve_lookml_constants(view.sql_table_name)
-                sql_table_name = self._render_table_name(sql_table_name, model_name, view_name=view.name)
-
-                # Column lineage only depends on the view definition, so resolve it once
-                column_lineage = self._extract_column_lineage(view)
-
-                for db_service_prefix in db_service_prefixes or []:
-                    db_service_name, *_ = self.parse_db_service_prefix(db_service_prefix)
-                    dialect = self._get_db_dialect(db_service_name)
-                    source_table_name = self._clean_table_name(sql_table_name, dialect)
-                    self._parsed_views[view.name] = source_table_name
-
-                    yield from self.build_lineage_requests(
-                        source=source_table_name,
-                        db_service_prefix=db_service_prefix,
-                        to_entity=self._view_data_model,
-                        column_lineage=column_lineage,
-                    )
-
-            elif view.derived_table:
-                sql_query = view.derived_table.sql
-                if not sql_query:
-                    return
-                sql_query = self._resolve_lookml_constants(sql_query, strip_unresolved=False)
-                if find_derived_references(sql_query):
-                    sql_query = self.replace_derived_references(sql_query)
-                    if view_references := find_derived_references(sql_query):
-                        self._add_dependency_edge(view.name, view_references)
-                        logger.warning(
-                            f"Not all references are replaced for standalone view [{view.name}]. Parsing it later."
-                        )
-                        return
-                logger.debug(f"Processing standalone view [{view.name}] with SQL: \n[{sql_query}]")
-                yield from self._build_lineage_for_view(view.name, sql_query)
-                if self._unparsed_views:
-                    self.build_lineage_for_unparsed_views()
+            yield from self._yield_view_source_lineage(view, f"{model_name}_{view.name}_view", model_name)
 
         except Exception as err:
             yield Either(
@@ -1174,7 +1262,7 @@ class LookerSource(DashboardServiceSource):
                 )
             )
 
-    def add_view_lineage(  # noqa: C901
+    def add_view_lineage(
         self,
         view: LookMlView,
         explore: LookmlModelExplore | ExploreRef,
@@ -1248,50 +1336,12 @@ class LookerSource(DashboardServiceSource):
                                 column_lineage=[],
                             )
 
-            db_service_prefixes = self.get_db_service_prefixes()
-
-            if view.sql_table_name:
-                sql_table_name = self._resolve_lookml_constants(view.sql_table_name)
-                sql_table_name = self._render_table_name(
-                    sql_table_name,
-                    explore.model_name,
-                    explore_name=explore.name,
-                    view_name=view.name,
-                )
-
-                # Column lineage only depends on the view definition, so resolve it once
-                column_lineage = self._extract_column_lineage(view)
-
-                for db_service_prefix in db_service_prefixes or []:
-                    db_service_name, *_ = self.parse_db_service_prefix(db_service_prefix)
-                    dialect = self._get_db_dialect(db_service_name)
-                    source_table_name = self._clean_table_name(sql_table_name, dialect)
-                    self._parsed_views[view.name] = source_table_name
-
-                    # View to the source is only there if we are informing the dbServiceNames
-                    yield from self.build_lineage_requests(
-                        source=source_table_name,
-                        db_service_prefix=db_service_prefix,
-                        to_entity=self._view_data_model,
-                        column_lineage=column_lineage,
-                    )
-
-            elif view.derived_table:
-                sql_query = view.derived_table.sql
-                if not sql_query:
-                    return
-                sql_query = self._resolve_lookml_constants(sql_query, strip_unresolved=False)
-                if find_derived_references(sql_query):
-                    sql_query = self.replace_derived_references(sql_query)
-                    # If we still have derived references, we cannot process the view
-                    if view_references := find_derived_references(sql_query):
-                        self._add_dependency_edge(view.name, view_references)
-                        logger.warning(f"Not all references are replaced for view [{view.name}]. Parsing it later.")
-                        return
-                logger.debug(f"Processing view [{view.name}] with SQL: \n[{sql_query}]")
-                yield from self._build_lineage_for_view(view.name, sql_query)
-                if self._unparsed_views:
-                    self.build_lineage_for_unparsed_views()
+            yield from self._yield_view_source_lineage(
+                view,
+                build_datamodel_name(explore.model_name, view.name) + "_view",
+                explore.model_name,
+                explore_name=explore.name,
+            )
 
         except Exception as err:
             yield Either(
